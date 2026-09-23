@@ -186,6 +186,9 @@ data CabalInstallException
   | CabalFileParseFailure CabalFileParseError
   | ProjectConfigParseFailure ProjectConfigParseError
   | ProjectConfigNoPackages FilePath
+  | Buck2NoPrelude
+  | Buck2ActionExtraArgs [String]
+  | Buck2NonLocalPackageLocation String
   deriving (Show)
 
 exceptionCodeCabalInstall :: CabalInstallException -> Int
@@ -343,6 +346,9 @@ exceptionCodeCabalInstall e = case e of
   CabalFileParseFailure{} -> 7166
   ProjectConfigParseFailure{} -> 7167
   ProjectConfigNoPackages{} -> 7168
+  Buck2NoPrelude{} -> 7169
+  Buck2ActionExtraArgs{} -> 7170
+  Buck2NonLocalPackageLocation{} -> 7171
 
 exceptionMessageCabalInstall :: CabalInstallException -> String
 exceptionMessageCabalInstall e = case e of
@@ -884,6 +890,21 @@ exceptionMessageCabalInstall e = case e of
       , "' requires at least one of the fields 'packages' "
       , "or 'optional-packages', but neither was specified."
       ]
+  Buck2NoPrelude ->
+    unlines
+      [ "No 'buck2/' directory found in the project root."
+      , "Clone the buck2 prelude and support scripts with:"
+      , ""
+      , "    git clone https://github.com/simonmar/haskell-buck2 buck2"
+      , ""
+      , "then re-run 'cabal buck2'."
+      ]
+  Buck2ActionExtraArgs extraArgs ->
+    "'cabal buck2' doesn't take any extra arguments: " ++ unwords extraArgs
+  Buck2NonLocalPackageLocation pkgIdStr ->
+    "cabal buck2: local package "
+      ++ pkgIdStr
+      ++ " isn't an unpacked local directory - can't generate a BUCK file for it."
 
 instance Exception (VerboseException CabalInstallException) where
   displayException :: VerboseException CabalInstallException -> [Char]

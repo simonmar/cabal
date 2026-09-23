@@ -100,8 +100,13 @@ library
         Distribution.Client.BuildReports.Storage
         Distribution.Client.BuildReports.Types
         Distribution.Client.BuildReports.Upload
+        Distribution.Client.Buck2.CabalToBuck
+        Distribution.Client.Buck2.Generate
+        Distribution.Client.Buck2.Setup
+        Distribution.Client.Buck2.Starlark
         Distribution.Client.Check
         Distribution.Client.CmdBench
+        Distribution.Client.CmdBuck2
         Distribution.Client.CmdBuild
         Distribution.Client.CmdClean
         Distribution.Client.CmdConfigure
