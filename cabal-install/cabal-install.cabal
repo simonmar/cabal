@@ -102,6 +102,7 @@ library
         Distribution.Client.BuildReports.Upload
         Distribution.Client.Buck2.CabalToBuck
         Distribution.Client.Buck2.Generate
+        Distribution.Client.Buck2.Prebuilt
         Distribution.Client.Buck2.Setup
         Distribution.Client.Buck2.Starlark
         Distribution.Client.Check
