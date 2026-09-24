@@ -63,17 +63,20 @@ import Distribution.Client.DistDirLayout
   , StoreDirLayout (storeDirectory, storePackageDBPath)
   )
 import Distribution.Client.ProjectPlanning
-  ( ElaboratedInstallPlan
-  , ElaboratedSharedConfig (pkgConfigCompiler, pkgConfigCompilerProgs)
+  ( ElaboratedConfiguredPackage (elabInstallDirs)
+  , ElaboratedInstallPlan
+  , ElaboratedSharedConfig (pkgConfigCompiler, pkgConfigCompilerProgs, pkgConfigPlatform)
   )
 
 import Distribution.InstalledPackageInfo (parseInstalledPackageInfo)
 import Distribution.Package (HasUnitId (installedUnitId), packageName, packageVersion)
+import Distribution.Simple.BuildPaths (exeExtension)
 import Distribution.Simple.Compiler
   ( Compiler (compilerProperties)
   , compilerVersion
   )
 import Distribution.Simple.GHC (getGlobalPackageDB)
+import qualified Distribution.Simple.InstallDirs as InstallDirs
 import Distribution.Simple.Program.Builtin (ghcPkgProgram, ghcProgram)
 import Distribution.Simple.Program.Db (lookupProgram)
 import Distribution.Simple.Program.Types (ConfiguredProgram, programPath)
@@ -138,8 +141,15 @@ generatePrebuilt verbosity projectRoot cabalDirLayout shared depsPlan = do
 
   notice verbosity "cabal buck2: resolving prebuilt dependency closure"
   packages <- catMaybes <$> traverse (readPackage verbosity paths storeDB) unitIds
+  let alexPath = findToolBinary paths shared depsPlan "alex"
+      happyPath = findToolBinary paths shared depsPlan "happy"
 
-  when (any (not . rpIsGlobal) packages) $
+  -- Needed by any package's own library files, *and* independently by
+  -- alex/happy's own binary path - a build-tool-only dependency (an
+  -- executable, no library) contributes no ResolvedPackage at all (see
+  -- readPackage), so checking `packages` alone would miss a project
+  -- that needs alex/happy but nothing else store-installed.
+  when (any (not . rpIsGlobal) packages || any inStore [alexPath, happyPath]) $
     ensureSymlink (targetDir </> "cabal-store") storeRootAbs
 
   notice verbosity "cabal buck2: building filtered store package db"
@@ -148,7 +158,7 @@ generatePrebuilt verbosity projectRoot cabalDirLayout shared depsPlan = do
   notice verbosity "cabal buck2: generating third-party/haskell/BUCK"
   writeBuckFile targetDir paths packages
 
-  writeToolsFile targetDir ghcVersionStr ghcDynamic
+  writeToolsFile targetDir ghcVersionStr ghcDynamic alexPath happyPath
 
 -- | The three repo-relative anchors every generated path is expressed
 -- against: the symlinks 'generatePrebuilt' just created, plus the GHC
@@ -361,8 +371,46 @@ relTo root repoRelPrefix path =
   let r = makeRelative root path
    in if r /= path then Just (repoRelPrefix </> r) else Nothing
 
-writeToolsFile :: FilePath -> String -> Bool -> IO ()
-writeToolsFile targetDir ghcVersionStr ghcDynamic =
+-- | The store-installed binary path (repo-relative, like everything else
+-- 'toRepoRelative' produces) for a build-tool dependency package - e.g.
+-- @alex@\/@happy@, needed by buck2/alex_happy.bzl to preprocess @.x@\/@.y@
+-- sources - or 'Nothing' if the project doesn't need it at all. A
+-- simplified 'CmdListBin.elaboratedPackage'\/@bin_file'@: alex\/happy are
+-- always external Hackage dependencies, never a local package, so the
+-- inplace-build-style branch that logic also has to handle never applies
+-- here, and (being plain, single-executable packages) their own
+-- executable is always named after the package itself, with no need to
+-- resolve a target selector to find out which component that is.
+findToolBinary :: RepoPaths -> ElaboratedSharedConfig -> ElaboratedInstallPlan -> String -> Maybe FilePath
+findToolBinary paths shared plan toolName =
+  listToMaybe
+    [ rel
+    | pkg <- InstallPlan.toList plan
+    , Just elab <- [configuredOrInstalled pkg]
+    , prettyShow (packageName elab) == toolName
+    , let absPath = InstallDirs.bindir (elabInstallDirs elab) </> toolName <.> exeExtension (pkgConfigPlatform shared)
+    , Just rel <- [toRepoRelative paths absPath]
+    ]
+
+-- | Same package, in either of the two states a *non-local* dependency
+-- that's actually going to be used can be in: 'Configured' (needs
+-- building this run) or 'Installed' (already built and installed from a
+-- previous run, nothing to do - which is what alex/happy settle into on
+-- any @cabal buck2@ after the first, once their build is cached). Unlike
+-- 'installedUnitId' (a 'HasUnitId' method, already defined uniformly
+-- across all three 'GenericPlanPackage' constructors), there's no
+-- existing helper for this, since most other call sites here only need
+-- the unit id, not the full 'ElaboratedConfiguredPackage'.
+configuredOrInstalled :: InstallPlan.GenericPlanPackage ipkg srcpkg -> Maybe srcpkg
+configuredOrInstalled (InstallPlan.Configured spkg) = Just spkg
+configuredOrInstalled (InstallPlan.Installed spkg) = Just spkg
+configuredOrInstalled InstallPlan.PreExisting{} = Nothing
+
+inStore :: Maybe FilePath -> Bool
+inStore = maybe False ("cabal-store" `isPrefixOf`)
+
+writeToolsFile :: FilePath -> String -> Bool -> Maybe FilePath -> Maybe FilePath -> IO ()
+writeToolsFile targetDir ghcVersionStr ghcDynamic alexPath happyPath =
   writeFile (targetDir </> "tools.bzl") $
     unlines
       [ "# @generated by `cabal buck2` - do not edit by hand."
@@ -372,9 +420,6 @@ writeToolsFile targetDir ghcVersionStr ghcDynamic =
       , "GHC_BIN_DIR = \"third-party/haskell/ghc-bin\""
       , "GHC_DYNAMIC = " ++ (if ghcDynamic then "True" else "False")
       , ""
-      -- TODO: resolve real alex/happy binary paths in-process (needs the
-      -- same bin-path logic as `cabal list-bin`) - see buck2.md's "handle
-      -- alex/happy sources" TODO.
-      , "ALEX = \"third-party/haskell/missing\""
-      , "HAPPY = \"third-party/haskell/missing\""
+      , "ALEX = " ++ show ("third-party/haskell/" ++ fromMaybe "missing" alexPath)
+      , "HAPPY = " ++ show ("third-party/haskell/" ++ fromMaybe "missing" happyPath)
       ]
