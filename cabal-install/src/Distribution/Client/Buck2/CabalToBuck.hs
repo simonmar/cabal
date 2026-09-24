@@ -20,6 +20,7 @@ import System.FilePath ((<.>), (</>))
 
 import qualified Data.Map as Map
 
+import qualified Distribution.Compat.NonEmptySet as NES
 import Distribution.Compiler (CompilerFlavor (GHC))
 import qualified Distribution.ModuleName as ModuleName
 import Distribution.Package (packageName)
@@ -36,6 +37,7 @@ import Distribution.PackageDescription
   , cxxSources
   , cSources
   , defaultExtensions
+  , extraLibs
   , hcOptions
   , hsSourceDirs
   , includeDirs
@@ -45,7 +47,7 @@ import Distribution.PackageDescription
   , targetBuildDepends
   )
 import Distribution.Types.Component (Component (..), componentBuildInfo)
-import Distribution.Types.Dependency (depPkgName)
+import Distribution.Types.Dependency (depLibraries, depPkgName)
 import Distribution.Types.PackageName (PackageName, unPackageName)
 import Distribution.Types.PkgconfigDependency (PkgconfigDependency (..))
 import Distribution.Types.PkgconfigName (unPkgconfigName)
@@ -88,8 +90,29 @@ generatePackageTargets
   -> FilePath
   -> PackageDescription
   -> IO PackageTargets
-generatePackageTargets verbosity localIndex pkgDir pkgDesc =
-  mconcat <$> traverse (generateComponent verbosity localIndex pkgDir pkgDesc) (pkgBuildableComponents pkgDesc)
+generatePackageTargets verbosity localIndex pkgDir pkgDesc = do
+  targets <- mconcat <$> traverse (generateComponent verbosity localIndex pkgDir pkgDesc) (pkgBuildableComponents pkgDesc)
+  return targets{ptCalls = dedupPkgconfigCalls (ptCalls targets)}
+
+-- | Two components of the *same* package sharing a @pkgconfig-depends@
+-- each generate their own @external_pkgconfig_library()@ call (from
+-- 'cxxLibraryFor', called once per component) - harmless on its own, but
+-- both would declare the same target @name@ in the same
+-- @generated_targets()@, which buck2 rejects as a duplicate target. Kept
+-- as a post-pass here (rather than threading a running set through
+-- component generation) so each component's own generation stays
+-- self-contained; cross-*package* duplicates - two different local
+-- packages needing the same system library - aren't addressed by this,
+-- since each package's calls only ever collide with its own.
+dedupPkgconfigCalls :: [Call] -> [Call]
+dedupPkgconfigCalls = go []
+  where
+    go _ [] = []
+    go seen (c : cs)
+      | callFn c == "external_pkgconfig_library"
+      , Just (VStr n) <- lookup "name" (callArgs c) =
+          if n `elem` seen then go seen cs else c : go (n : seen) cs
+      | otherwise = c : go seen cs
 
 generateComponent
   :: Verbosity
@@ -99,9 +122,7 @@ generateComponent
   -> Component
   -> IO PackageTargets
 generateComponent verbosity localIndex pkgDir pkgDesc comp = case comp of
-  CLib lib
-    | libName lib == LMainLibName -> library (unPackageName (packageName pkgDesc)) lib
-    | otherwise -> skip ("named sub-library " ++ prettyLibName (libName lib))
+  CLib lib -> library (libTargetName (packageName pkgDesc) (libName lib)) lib
   CExe exe -> executable exe
   CTest test -> testSuite test
   CFLib _ -> skip "foreign library (not supported yet)"
@@ -110,9 +131,6 @@ generateComponent verbosity localIndex pkgDir pkgDesc comp = case comp of
     skip why = do
       warn verbosity $ "cabal buck2: skipping " ++ why ++ " in package " ++ unPackageName (packageName pkgDesc)
       return mempty
-
-    prettyLibName (LSubLibName n) = unUnqualComponentName n
-    prettyLibName LMainLibName = "(main library)"
 
     library targetName lib = do
       let bi = libBuildInfo lib
@@ -126,6 +144,7 @@ generateComponent verbosity localIndex pkgDir pkgDesc comp = case comp of
                 , ("srcs", VDict srcs)
                 ]
                   ++ compilerFlagsArg bi
+                  ++ exportedLinkerFlagsArg bi
                   ++ optionalListArg "packages" pkgs
                   ++ optionalListArg "deps" (deps ++ cxxDeps)
                   ++ [("visibility", strList ["PUBLIC"])]
@@ -148,6 +167,7 @@ generateComponent verbosity localIndex pkgDir pkgDesc comp = case comp of
                 , ("srcs", VDict [("Main.hs", str mainSrc)])
                 ]
                   ++ compilerFlagsArg bi
+                  ++ linkerFlagsArg bi
                   ++ optionalListArg "packages" pkgs
                   ++ optionalListArg "deps" (deps ++ cxxDeps)
                   ++ [("visibility", strList ["PUBLIC"])]
@@ -171,6 +191,7 @@ generateComponent verbosity localIndex pkgDir pkgDesc comp = case comp of
                   , ("srcs", VDict [("Main.hs", str mainSrc)])
                   ]
                     ++ compilerFlagsArg bi
+                    ++ linkerFlagsArg bi
                     ++ optionalListArg "packages" pkgs
                     ++ optionalListArg "deps" (deps ++ cxxDeps)
                 )
@@ -194,23 +215,62 @@ compilerFlagsArg bi = optionalListArg "compiler_flags" (hcOptions GHC bi ++ cppO
   where
     extensionFlags = ["-X" ++ prettyShow ext | ext <- defaultExtensions bi]
 
+-- | @extra-libraries@ on a library, as @-l@ flags on its
+-- @exported_linker_flags@ - a local fork of buck2/prelude/haskell/
+-- haskell.bzl (see buck2\/buck2.md) adds this attr to haskell_library(),
+-- propagating to whatever finally links against it via the standard
+-- native-link-info machinery (unlike plain @linker_flags@, which
+-- haskell_library() only ever applies to its own @.so@ link step - see
+-- that fork's own commit for the full story of why this was needed
+-- instead of just using @linker_flags@ here).
+exportedLinkerFlagsArg :: BuildInfo -> [(String, Value)]
+exportedLinkerFlagsArg bi = optionalListArg "exported_linker_flags" ["-l" ++ lib | lib <- extraLibs bi]
+
+-- | @extra-libraries@ on an executable\/test-suite, as @-l@ flags on its
+-- plain @linker_flags@ - correct as-is here (unlike on a library): both
+-- rules already apply @linker_flags@ directly to their own, one and only,
+-- final executable link.
+linkerFlagsArg :: BuildInfo -> [(String, Value)]
+linkerFlagsArg bi = optionalListArg "linker_flags" ["-l" ++ lib | lib <- extraLibs bi]
+
 optionalListArg :: String -> [String] -> [(String, Value)]
 optionalListArg _ [] = []
 optionalListArg name xs = [(name, strList (nub xs))]
 
--- | Split a component's @build-depends@ into external package names (fed
--- to buck2/haskell.bzl's @packages =@ convenience param) and local-project
--- target labels (fed to @deps =@).
+-- | The buck2 target name for one of a package's libraries: the package
+-- name itself for the main (unnamed) library, matching every other
+-- reference to it (@packages = [...]@, other packages' @build-depends@,
+-- ...); the sub-library's own unqualified name otherwise - always unique
+-- within one package's BUCK file, since Cabal itself already requires
+-- every component name in a package to be distinct.
+libTargetName :: PackageName -> LibraryName -> String
+libTargetName pn LMainLibName = unPackageName pn
+libTargetName _ (LSubLibName n) = unUnqualComponentName n
+
+-- | Split a component's @build-depends@ (each of which may name one or
+-- more specific sub-libraries of a package via @pkg:sublib@ - see
+-- 'depLibraries') into external package names (fed to
+-- buck2/haskell.bzl's @packages =@ convenience param - which only
+-- resolves a package's main library, so a named sub-library of an
+-- *external* package still only contributes its package name here, same
+-- as before this distinguished sub-libraries at all) and local-project
+-- target labels (fed to @deps =@, correctly pointing at the specific
+-- local sub-library's own target when one was named).
 classifyDeps :: LocalPackageIndex -> BuildInfo -> ([String], [String])
 classifyDeps localIndex bi =
-  ( [unPackageName pn | pn <- depNames, not (Map.member pn localIndex)]
-  , [localTargetLabel dir pn | pn <- depNames, Just dir <- [Map.lookup pn localIndex]]
+  ( nub [unPackageName pn | (pn, _) <- depPairs, not (Map.member pn localIndex)]
+  , nub [localTargetLabel dir (libTargetName pn ln) | (pn, ln) <- depPairs, Just dir <- [Map.lookup pn localIndex]]
   )
   where
-    depNames = nub (map depPkgName (targetBuildDepends bi))
+    depPairs =
+      nub
+        [ (depPkgName d, ln)
+        | d <- targetBuildDepends bi
+        , ln <- NES.toList (depLibraries d)
+        ]
 
-localTargetLabel :: FilePath -> PackageName -> String
-localTargetLabel dir pn = "//" ++ (if dir == "." then "" else dir) ++ ":" ++ unPackageName pn
+localTargetLabel :: FilePath -> String -> String
+localTargetLabel dir targetName = "//" ++ (if dir == "." then "" else dir) ++ ":" ++ targetName
 
 -- | Resolve each module in @hs-source-dirs@ to its real file, trying
 -- @.hs@\/@.lhs@\/@.hsc@ in turn (the extensions buck2/hsc2hs.bzl knows how
@@ -226,7 +286,11 @@ resolveOne verbosity pkgDir dirs m = do
   let modPath = ModuleName.toFilePath m
       hsPath = modPath <.> "hs"
       guess = firstDir dirs </> hsPath
-  found <- firstExisting pkgDir dirs [modPath <.> ext | ext <- ["hs", "lhs", "hsc"]]
+  -- buck2/haskell.bzl's own srcs-resolution (_resolve_src) auto-detects
+  -- .hsc/.x/.y by the *source* file's extension and runs it through
+  -- hsc2hs()/alex()/happy() - already loaded by haskell.bzl itself, so
+  -- nothing extra needs to be loaded here for that to work.
+  found <- firstExisting pkgDir dirs [modPath <.> ext | ext <- ["hs", "lhs", "hsc", "x", "y"]]
   case found of
     Just real -> return (hsPath, str real)
     Nothing -> do
