@@ -390,8 +390,8 @@ macrosFlagsArg pkgDir rootRelPkgDir targetName pkgDesc pkgVersions bi = do
         , Just v <- [Map.lookup pn pkgVersions]
         ]
     headerText = generatePackageVersionMacros (packageVersion pkgDesc) depPids
-    headerRelPath = "buck2-cabal-macros" </> targetName </> "cabal_macros.h"
-    headerDir = pkgDir </> "buck2-cabal-macros" </> targetName
+    headerRelPath = "cabal-buck2" </> "autogen" </> targetName </> "cabal_macros.h"
+    headerDir = pkgDir </> "cabal-buck2" </> "autogen" </> targetName
     headerPath = pkgDir </> headerRelPath
 
 optionalListArg :: String -> [String] -> [(String, Value)]
@@ -508,10 +508,12 @@ resolveOne verbosity pkgDesc pkgDir dirs m
 -- real information.
 writePathsModule :: FilePath -> PackageDescription -> ModuleName.ModuleName -> IO String
 writePathsModule pkgDir pkgDesc m = do
-  writeFile (pkgDir </> fileName) contents
-  return fileName
+  createDirectoryIfMissing True (pkgDir </> "cabal-buck2" </> "autogen")
+  writeFile (pkgDir </> relPath) contents
+  return relPath
   where
     fileName = ModuleName.toFilePath m <.> "hs"
+    relPath = "cabal-buck2" </> "autogen" </> fileName
     modName = prettyShow m
     contents =
       unlines

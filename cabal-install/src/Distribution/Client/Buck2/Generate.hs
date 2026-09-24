@@ -6,7 +6,15 @@
 --   * @BUCK.cabal.bzl@ is fully regenerated on every run (it's marked
 --     @\@generated@ and never hand-edited) and defines a single
 --     @generated_targets()@ macro with one rule call per buildable
---     component.
+--     component. Deliberately kept at the package root (*not* under
+--     @cabal-buck2\/@ alongside the generated @Paths_\<pkg\>@ stand-in
+--     and each component's own @cabal_macros.h@ - see
+--     "Distribution.Client.Buck2.CabalToBuck") - buck2's @load()@ only
+--     accepts a bare same-package filename for a same-package path (no
+--     @\/@ allowed - see 'renderBuckWrapper's own haddock), and a fully
+--     cell-qualified path instead would make every hand-maintained
+--     @BUCK@ depend on its own package's location in the project, which
+--     defeats the point of it being freely hand-editable\/relocatable.
 --   * @BUCK@ is created only if it doesn't already exist, as a two-line
 --     file that loads and calls that macro. This is the file a user is
 --     free to hand-edit - to add extra targets, or stop calling
@@ -131,6 +139,17 @@ indentBlock = unlines . map indentLine . lines
     indentLine "" = ""
     indentLine l = "    " ++ l
 
+-- | buck2's @load()@ doesn't accept a same-package path containing a
+-- @\/@ (@:cabal-buck2\/targets.bzl@ fails outright: "Unable to parse
+-- import spec ... but got a path") - only a bare same-package filename
+-- (@:filename.bzl@) or a fully cell-qualified one
+-- (@\/\/package\/path:filename.bzl@) work, and the latter would make
+-- this hand-maintained file depend on its own package's location in the
+-- project (confirmed empirically against the real buck2 binary while
+-- trying @BUCK.cabal.bzl@ living under @cabal-buck2\/@ instead - reverted
+-- for exactly this reason). Keeping @BUCK.cabal.bzl@ at the package root
+-- avoids the whole issue: it's a same-package, no-slash filename either
+-- way.
 renderBuckWrapper :: String
 renderBuckWrapper =
   unlines
