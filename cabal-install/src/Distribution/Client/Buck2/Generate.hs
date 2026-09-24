@@ -24,13 +24,20 @@ import System.FilePath (makeRelative, (</>))
 
 import qualified Data.Map as Map
 
+import qualified Distribution.ModuleName as ModuleName
 import Distribution.Package (packageName)
-import Distribution.PackageDescription (PackageDescription)
-import Distribution.Pretty (prettyShow)
+import Distribution.PackageDescription
+  ( Library (exposedModules, reexportedModules)
+  , PackageDescription
+  , library
+  )
+import Distribution.Types.ModuleReexport
+  ( ModuleReexport (moduleReexportOriginalName, moduleReexportOriginalPackage)
+  )
 import Distribution.Types.PackageName (PackageName)
+import Distribution.Version (Version)
 
 import Distribution.Simple.Utils (notice, warn)
-import Distribution.Verbosity (Verbosity)
 
 import Distribution.Client.Buck2.CabalToBuck
 import Distribution.Client.Buck2.Starlark
@@ -39,25 +46,56 @@ import Distribution.Client.Buck2.Starlark
 -- every local package. @projectRoot@ is the buck2 cell root (the
 -- directory containing @.buckconfig@), used to turn each package's
 -- absolute directory into the cell-relative one buck2 target labels need.
-generateAllPackages :: Verbosity -> FilePath -> [(FilePath, PackageDescription)] -> IO ()
-generateAllPackages verbosity projectRoot pkgs = do
-  traverse_ (generateOnePackage verbosity localIndex projectRoot) pkgs
+-- @pkgVersions@ is the solver-resolved version of every package in the
+-- build plan (local and external), needed to generate each component's
+-- own @cabal_macros.h@.
+generateAllPackages :: Verbosity -> FilePath -> Map PackageName Version -> [(FilePath, PackageDescription)] -> IO ()
+generateAllPackages verbosity projectRoot pkgVersions pkgs = do
+  traverse_ (generateOnePackage verbosity localIndex projectRoot pkgVersions) pkgs
   where
     localIndex :: LocalPackageIndex
     localIndex =
       Map.fromList
-        [ (packageName pkgDesc, rootRelativeDir projectRoot pkgDir)
+        [ (packageName pkgDesc, (rootRelativeDir projectRoot pkgDir, reexportOrigins pkgDesc))
         | (pkgDir, pkgDesc) <- pkgs
         ]
+    -- Every module exposed by any local package's main library, to
+    -- resolve a `reexported-modules:` entry that (as is typical - see
+    -- Cabal.cabal's own reexport of Cabal-syntax) names only the bare
+    -- module, not an explicit `origin-package:Module` - Cabal itself
+    -- resolves that form by searching the reexporting package's own
+    -- build-depends for whichever one actually defines it, which for a
+    -- *local* origin this index can do too (an external origin doesn't
+    -- need this: its real .conf file already declares the reexport
+    -- directly to ghc-pkg).
+    moduleOwners :: Map.Map ModuleName.ModuleName PackageName
+    moduleOwners =
+      Map.fromList
+        [ (m, packageName pkgDesc)
+        | (_, pkgDesc) <- pkgs
+        , Just lib <- [library pkgDesc]
+        , m <- exposedModules lib
+        ]
+    reexportOrigins pkgDesc =
+      nub
+        [ pn
+        | Just lib <- [library pkgDesc]
+        , reexport <- reexportedModules lib
+        , Just pn <- [originPackage reexport]
+        , pn /= packageName pkgDesc
+        ]
+    originPackage reexport = case moduleReexportOriginalPackage reexport of
+      Just pn -> Just pn
+      Nothing -> Map.lookup (moduleReexportOriginalName reexport) moduleOwners
 
 rootRelativeDir :: FilePath -> FilePath -> FilePath
 rootRelativeDir projectRoot pkgDir = case makeRelative projectRoot pkgDir of
   "" -> "."
   rel -> rel
 
-generateOnePackage :: Verbosity -> LocalPackageIndex -> FilePath -> (FilePath, PackageDescription) -> IO ()
-generateOnePackage verbosity localIndex projectRoot (pkgDir, pkgDesc) = do
-  targets <- generatePackageTargets verbosity localIndex pkgDir pkgDesc
+generateOnePackage :: Verbosity -> LocalPackageIndex -> FilePath -> Map PackageName Version -> (FilePath, PackageDescription) -> IO ()
+generateOnePackage verbosity localIndex projectRoot pkgVersions (pkgDir, pkgDesc) = do
+  targets <- generatePackageTargets verbosity localIndex (rootRelativeDir projectRoot pkgDir) pkgVersions pkgDir pkgDesc
   let pkgName = packageName pkgDesc
   if null (ptCalls targets)
     then warn verbosity $ "cabal buck2: no buck2 targets generated for package " ++ show pkgName

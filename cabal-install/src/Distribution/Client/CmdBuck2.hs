@@ -30,12 +30,15 @@ import Distribution.Client.Compat.Prelude
 import Prelude ()
 
 import qualified Data.Map as Map
+import qualified Data.Set as Set
 
 import qualified Distribution.Client.CmdBuild as CmdBuild
 import Distribution.Client.CmdErrorMessages (renderCannotPruneDependencies, reportTargetProblems)
 import qualified Distribution.Client.InstallPlan as InstallPlan
 
-import Distribution.Client.DistDirLayout (DistDirLayout (distProjectRootDirectory))
+import Distribution.Client.DistDirLayout
+  ( DistDirLayout (distProjectRootDirectory, distUnpackedSrcDirectory)
+  )
 import Distribution.Client.NixStyleOptions
   ( NixStyleFlags (..)
   , cfgVerbosity
@@ -60,10 +63,11 @@ import Distribution.Client.Setup
   )
 import Distribution.Client.Types.PackageLocation (PackageLocation (..))
 
-import Distribution.Package (packageId)
+import Distribution.Package (HasUnitId (installedUnitId), packageId, packageName, packageVersion)
 import Distribution.Simple.Command (CommandUI (..), usageAlternatives)
 import Distribution.Simple.Flag (toFlag)
 import Distribution.Simple.Utils (dieWithException, notice)
+import Distribution.Types.UnitId (UnitId)
 import Distribution.Verbosity (normal)
 
 import Distribution.Client.Buck2.Generate (generateAllPackages)
@@ -131,7 +135,7 @@ buck2Action flags extraArgs globalFlags = do
           let elaboratedPlan' = pruneInstallPlanToTargets TargetActionBuild targets elaboratedPlan
           elaboratedPlan'' <-
             either (dieWithException verbosity . ReportCannotPruneDependencies . renderCannotPruneDependencies) return $
-              pruneInstallPlanToDependencies (Map.keysSet targets) elaboratedPlan'
+              pruneToDependenciesNeeded (Map.keysSet targets) elaboratedPlan'
           return (elaboratedPlan'', targets)
 
       notice verbosity "cabal buck2: building dependencies (cabal build all --only-dependencies)"
@@ -144,23 +148,61 @@ buck2Action flags extraArgs globalFlags = do
         verbosity
         projectRoot
         (cabalDirLayout baseCtx)
+        (distDirLayout baseCtx)
         elaboratedShared
         elaboratedPlanToExecute
 
+      -- Every genuinely local package, *plus* every non-local one whose
+      -- own build was forced 'inplace' by depending on one (e.g.
+      -- hackage-security, via its own @cabal-syntax@ flag, on the local
+      -- in-tree Cabal-syntax): a non-local, ordinarily-prebuilt package
+      -- has no such coupling to any *particular* compiled unit of its
+      -- own dependencies (that's the entire point of the store's
+      -- hash-addressed, ABI-stable installs), but an inplace one is
+      -- compiled directly against whatever its dependencies actually
+      -- were at that specific build - and here, that's the buck2-built
+      -- Cabal-syntax, not any prebuilt one. Reusing a *different*,
+      -- separately-compiled copy of hackage-security (the one plain
+      -- `cabal build` already produced, against the real in-tree
+      -- Cabal-syntax `dist-newstyle` itself built) would leave GHC with
+      -- two nominally distinct, incompatible copies of Cabal-syntax's
+      -- types in the one build - confirmed concretely: cabal-install's
+      -- own use of hackage-security's Security API failed to compile
+      -- ("Couldn't match type PackageIdentifier ... Actual: PackageId ...
+      -- defined ... in package root-Cabal-syntax-Cabal-syntax-1.0.0")
+      -- the first time this was tried without this fix. So an inplace
+      -- non-local package needs the exact same treatment as a genuinely
+      -- local one - a real buck2 rule generated from its own source,
+      -- built against the same (buck2-built) local dependency, not a
+      -- prebuilt one (see 'Distribution.Client.Buck2.Prebuilt's own
+      -- matching exclusion of these from its own prebuilt-rule set).
       localPkgs <-
         sequenceA
           [ do
-              dir <- localPackageDir verbosity elab
+              dir <- packageSourceDir verbosity (distDirLayout baseCtx) elab
               return (dir, elabPkgDescription elab)
           | InstallPlan.Configured elab <- InstallPlan.toList elaboratedPlanOriginal
-          , elabLocalToProject elab
+          , elabLocalToProject elab || elabBuildStyle elab /= BuildAndInstall
           ]
+      -- The resolved version of every package in the plan (local and
+      -- external alike), needed to generate each component's own
+      -- @cabal_macros.h@ (see 'Distribution.Client.Buck2.CabalToBuck') -
+      -- real Cabal defines @VERSION_x@\/@MIN_VERSION_x@ for a package's
+      -- whole build-depends closure using exactly these solver-resolved
+      -- versions, not just whatever version range the @.cabal@ file
+      -- itself names.
+      let pkgVersions =
+            Map.fromList
+              [ (packageName pid, packageVersion pid)
+              | pkg <- InstallPlan.toList elaboratedPlanOriginal
+              , let pid = InstallPlan.foldPlanPackage packageId packageId pkg
+              ]
       -- Per-component elaboration gives each local package one
       -- 'ElaboratedConfiguredPackage' per component (library, executable,
       -- ...), all sharing the same directory and the same (whole-package)
       -- 'PackageDescription' - so without this, a package with N
       -- buildable components would get regenerated N times over.
-      generateAllPackages verbosity projectRoot (nubBy ((==) `on` fst) localPkgs)
+      generateAllPackages verbosity projectRoot pkgVersions (nubBy ((==) `on` fst) localPkgs)
 
       notice verbosity $
         unlines
@@ -177,3 +219,56 @@ localPackageDir :: Verbosity -> ElaboratedConfiguredPackage -> IO FilePath
 localPackageDir verbosity elab = case elabPkgSourceLocation elab of
   LocalUnpackedPackage dir -> return dir
   _ -> dieWithException verbosity (Buck2NonLocalPackageLocation (prettyShow (packageId elab)))
+
+-- | Real on-disk source directory for any package this run is going to
+-- generate a buck2 rule for - a genuinely local one (always
+-- 'LocalUnpackedPackage'; delegates to 'localPackageDir') or an inplace
+-- non-local one, resolved the same way
+-- 'Distribution.Client.ProjectPlanning.Types.dataDirEnvVarForPackage'
+-- does for the same 'BuildInplaceOnly' case: a plain source checkout
+-- uses its own path directly, anything fetched as a tarball\/repo was
+-- already unpacked to 'distUnpackedSrcDirectory' to be built inplace in
+-- the first place.
+packageSourceDir :: Verbosity -> DistDirLayout -> ElaboratedConfiguredPackage -> IO FilePath
+packageSourceDir verbosity distDirLayout elab
+  | elabLocalToProject elab = localPackageDir verbosity elab
+  | otherwise = case elabPkgSourceLocation elab of
+      LocalUnpackedPackage dir -> return dir
+      LocalTarballPackage{} -> return unpackedPath
+      RemoteTarballPackage{} -> return unpackedPath
+      RepoTarballPackage{} -> return unpackedPath
+      RemoteSourceRepoPackage _ (Just localCheckout) -> return localCheckout
+      RemoteSourceRepoPackage{} -> dieWithException verbosity (Buck2NonLocalPackageLocation (prettyShow (packageId elab)))
+  where
+    unpackedPath = distUnpackedSrcDirectory distDirLayout (elabPkgSourceId elab)
+
+-- | Like 'pruneInstallPlanToDependencies', but when excluding every
+-- selected target would leave a dangling edge, keep exactly the targets
+-- the failure says are still needed instead of giving up outright - and
+-- retry, since keeping one target in can itself reveal another one is
+-- needed too (transitively).
+--
+-- This is a real project shape, not a hypothetical: a @build-type:
+-- Custom@ local package's Setup.hs can have @setup-depends@ on another
+-- *local* package (e.g. cabal-testsuite's Setup needs Cabal-syntax to be
+-- built) - the Setup component that creates is a real node in the plan,
+-- but isn't itself one of the ordinary library\/exe\/test\/bench targets
+-- 'resolveTargetsFromSolver' selects, so plain
+-- 'pruneInstallPlanToDependencies' (asked to exclude literally every
+-- selected target) sees its now-dangling edge to Cabal-syntax and
+-- refuses outright, even though building Cabal-syntax here is exactly
+-- what's needed - it's a real dependency of the build, just not of any
+-- selected target directly.
+pruneToDependenciesNeeded
+  :: Set UnitId
+  -> ElaboratedInstallPlan
+  -> Either CannotPruneDependencies ElaboratedInstallPlan
+pruneToDependenciesNeeded excluded plan =
+  case pruneInstallPlanToDependencies excluded plan of
+    Right pruned -> Right pruned
+    Left err@(CannotPruneDependencies broken)
+      | Set.null keepIds || excluded' == excluded -> Left err
+      | otherwise -> pruneToDependenciesNeeded excluded' plan
+      where
+        keepIds = Set.fromList [installedUnitId dep | (_, missing) <- broken, dep <- missing]
+        excluded' = excluded `Set.difference` keepIds
