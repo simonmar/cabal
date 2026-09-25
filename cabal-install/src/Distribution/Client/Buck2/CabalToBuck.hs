@@ -135,7 +135,7 @@ generatePackageTargets verbosity localIndex rootRelPkgDir pkgVersions pkgDir pkg
 -- pass exists only to know the *outcome* early, not to report it twice.
 skippedLibraries :: Verbosity -> PackageDescription -> FilePath -> IO (Set LibraryName)
 skippedLibraries verbosity pkgDesc pkgDir =
-  (Set.fromList . catMaybes)
+  Set.fromList . catMaybes
     <$> traverse checkLib [lib | CLib lib <- pkgBuildableComponents pkgDesc]
   where
     quiet = modifyVerbosityFlags (\vf -> vf{vLevel = Silent}) verbosity
