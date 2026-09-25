@@ -152,30 +152,14 @@ buck2Action flags extraArgs globalFlags = do
         elaboratedShared
         elaboratedPlanToExecute
 
-      -- Every genuinely local package, *plus* every non-local one whose
-      -- own build was forced 'inplace' by depending on one (e.g.
-      -- hackage-security, via its own @cabal-syntax@ flag, on the local
-      -- in-tree Cabal-syntax): a non-local, ordinarily-prebuilt package
-      -- has no such coupling to any *particular* compiled unit of its
-      -- own dependencies (that's the entire point of the store's
-      -- hash-addressed, ABI-stable installs), but an inplace one is
-      -- compiled directly against whatever its dependencies actually
-      -- were at that specific build - and here, that's the buck2-built
-      -- Cabal-syntax, not any prebuilt one. Reusing a *different*,
-      -- separately-compiled copy of hackage-security (the one plain
-      -- `cabal build` already produced, against the real in-tree
-      -- Cabal-syntax `dist-newstyle` itself built) would leave GHC with
-      -- two nominally distinct, incompatible copies of Cabal-syntax's
-      -- types in the one build - confirmed concretely: cabal-install's
-      -- own use of hackage-security's Security API failed to compile
-      -- ("Couldn't match type PackageIdentifier ... Actual: PackageId ...
-      -- defined ... in package root-Cabal-syntax-Cabal-syntax-1.0.0")
-      -- the first time this was tried without this fix. So an inplace
-      -- non-local package needs the exact same treatment as a genuinely
-      -- local one - a real buck2 rule generated from its own source,
-      -- built against the same (buck2-built) local dependency, not a
-      -- prebuilt one (see 'Distribution.Client.Buck2.Prebuilt's own
-      -- matching exclusion of these from its own prebuilt-rule set).
+      -- Every genuinely local package, *plus* every non-local one
+      -- whose own build was forced 'inplace' by depending on
+      -- one. When a non-local package is forced inplace we must
+      -- include it in the set of buck2-built packages, otherwise the
+      -- build will contain multiple incompatible versions of the
+      -- local dependency. A real-world example of this is
+      -- hackage-security in the cabal project, which is not a local
+      -- package but depends on the local Cabal-syntax.
       localPkgs <-
         sequenceA
           [ do
