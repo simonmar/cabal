@@ -39,11 +39,12 @@ import Distribution.PackageDescription
   , PackageDescription
   , library
   )
+import Distribution.Types.ComponentName (ComponentName)
+import Distribution.Types.LocalBuildInfo (LocalBuildInfo)
 import Distribution.Types.ModuleReexport
   ( ModuleReexport (moduleReexportOriginalName, moduleReexportOriginalPackage)
   )
 import Distribution.Types.PackageName (PackageName)
-import Distribution.Version (Version)
 
 import Distribution.Simple.Utils (notice, ordNub, warn)
 
@@ -54,12 +55,15 @@ import Distribution.Client.Buck2.Starlark
 -- every local package. @projectRoot@ is the buck2 cell root (the
 -- directory containing @.buckconfig@), used to turn each package's
 -- absolute directory into the cell-relative one buck2 target labels need.
--- @pkgVersions@ is the solver-resolved version of every package in the
--- build plan (local and external), needed to generate each component's
--- own @cabal_macros.h@.
-generateAllPackages :: Verbosity -> FilePath -> Map PackageName Version -> [(FilePath, PackageDescription)] -> IO ()
-generateAllPackages verbosity projectRoot pkgVersions pkgs = do
-  traverse_ (generateOnePackage verbosity localIndex projectRoot pkgVersions) pkgs
+-- @componentLBIs@ is a real, Cabal-computed 'LocalBuildInfo' for every
+-- local (or quasi-local) *component* - see "Distribution.Client.CmdBuck2"
+-- - used to generate each component's own @cabal_macros.h@\/
+-- @Paths_\<pkg\>@\/@PackageInfo_\<pkg\>@ via Cabal's own real generators
+-- (see "Distribution.Client.Buck2.CabalToBuck") instead of reimplementing
+-- pieces of them by hand.
+generateAllPackages :: Verbosity -> FilePath -> Map (PackageName, ComponentName) LocalBuildInfo -> [(FilePath, PackageDescription)] -> IO ()
+generateAllPackages verbosity projectRoot componentLBIs pkgs = do
+  traverse_ (generateOnePackage verbosity localIndex projectRoot componentLBIs) pkgs
   where
     localIndex :: LocalPackageIndex
     localIndex =
@@ -101,9 +105,9 @@ rootRelativeDir projectRoot pkgDir = case makeRelative projectRoot pkgDir of
   "" -> "."
   rel -> rel
 
-generateOnePackage :: Verbosity -> LocalPackageIndex -> FilePath -> Map PackageName Version -> (FilePath, PackageDescription) -> IO ()
-generateOnePackage verbosity localIndex projectRoot pkgVersions (pkgDir, pkgDesc) = do
-  targets <- generatePackageTargets verbosity localIndex (rootRelativeDir projectRoot pkgDir) pkgVersions pkgDir pkgDesc
+generateOnePackage :: Verbosity -> LocalPackageIndex -> FilePath -> Map (PackageName, ComponentName) LocalBuildInfo -> (FilePath, PackageDescription) -> IO ()
+generateOnePackage verbosity localIndex projectRoot componentLBIs (pkgDir, pkgDesc) = do
+  targets <- generatePackageTargets verbosity localIndex (rootRelativeDir projectRoot pkgDir) componentLBIs pkgDir pkgDesc
   let pkgName = packageName pkgDesc
   if null (ptCalls targets)
     then warn verbosity $ "cabal buck2: no buck2 targets generated for package " ++ show pkgName

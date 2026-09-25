@@ -34,10 +34,11 @@ import qualified Data.Set as Set
 
 import qualified Distribution.Client.CmdBuild as CmdBuild
 import Distribution.Client.CmdErrorMessages (renderCannotPruneDependencies, reportTargetProblems)
+import qualified Distribution.Client.InLibrary as InLibrary
 import qualified Distribution.Client.InstallPlan as InstallPlan
 
 import Distribution.Client.DistDirLayout
-  ( DistDirLayout (distProjectRootDirectory, distUnpackedSrcDirectory)
+  ( DistDirLayout (distBuildDirectory, distProjectRootDirectory, distUnpackedSrcDirectory)
   )
 import Distribution.Client.NixStyleOptions
   ( NixStyleFlags (..)
@@ -51,6 +52,11 @@ import Distribution.Client.ProjectOrchestration
 -- matching what 'resolveTargetsFromSolver' below returns), which would
 -- otherwise be ambiguous with 'ProjectPlanning's lower-level original.
 import Distribution.Client.ProjectPlanning hiding (pruneInstallPlanToTargets)
+import Distribution.Client.ProjectPlanning.Types
+  ( elabComponentName
+  , elabDistDirParams
+  , elabExeDependencyPaths
+  )
 import Distribution.Client.ScriptUtils
   ( AcceptNoTargets (..)
   , TargetContext (..)
@@ -62,13 +68,32 @@ import Distribution.Client.Setup
   , InstallFlags (installOnlyDeps)
   )
 import Distribution.Client.Types.PackageLocation (PackageLocation (..))
+import Distribution.Client.Types.ReadyPackage (GenericReadyPackage (ReadyPackage))
 
-import Distribution.Package (HasUnitId (installedUnitId), packageId, packageName, packageVersion)
+import qualified Distribution.PackageDescription as PD
+import Distribution.Package (HasUnitId (installedUnitId), packageId, packageName)
+import Distribution.PackageDescription (PackageDescription)
+import Distribution.Simple.Compiler (PackageDBX (GlobalPackageDB))
+import qualified Distribution.Simple.PackageIndex as PackageIndex
+import Distribution.Simple.PackageIndex (InstalledPackageIndex)
 import Distribution.Simple.Command (CommandUI (..), usageAlternatives)
 import Distribution.Simple.Flag (toFlag)
+import Distribution.Simple.Program.Builtin (builtinPrograms)
+import Distribution.Simple.Program.Db (prependProgramSearchPathNoLogging, restoreProgramDb)
+import Distribution.Simple.Register (generateRegistrationInfo)
 import Distribution.Simple.Utils (dieWithException, notice)
+import Distribution.Types.LocalBuildInfo
+  ( LocalBuildInfo
+  , componentNameCLBIs
+  , distPrefLBI
+  , relocatable
+  )
 import Distribution.Types.UnitId (UnitId)
-import Distribution.Verbosity (normal)
+import Distribution.Utils.Path (makeSymbolicPath)
+import Distribution.Verbosity (defaultVerbosityHandles, normal)
+
+import System.Directory (canonicalizePath)
+import System.FilePath ((</>))
 
 import Distribution.Client.Buck2.Generate (generateAllPackages)
 import Distribution.Client.Buck2.Prebuilt (generatePrebuilt)
@@ -144,13 +169,14 @@ buck2Action flags extraArgs globalFlags = do
       runProjectPostBuildPhase verbosity baseCtx buildCtx buildOutcomes
 
       ensureBuckconfigAndPackage verbosity projectRoot
-      generatePrebuilt
-        verbosity
-        projectRoot
-        (cabalDirLayout baseCtx)
-        (distDirLayout baseCtx)
-        elaboratedShared
-        elaboratedPlanToExecute
+      resolvedDeps <-
+        generatePrebuilt
+          verbosity
+          projectRoot
+          (cabalDirLayout baseCtx)
+          (distDirLayout baseCtx)
+          elaboratedShared
+          elaboratedPlanToExecute
 
       -- Every genuinely local package, *plus* every non-local one
       -- whose own build was forced 'inplace' by depending on
@@ -168,25 +194,70 @@ buck2Action flags extraArgs globalFlags = do
           | InstallPlan.Configured elab <- InstallPlan.toList elaboratedPlanOriginal
           , elabLocalToProject elab || elabBuildStyle elab /= BuildAndInstall
           ]
-      -- The resolved version of every package in the plan (local and
-      -- external alike), needed to generate each component's own
-      -- @cabal_macros.h@ (see 'Distribution.Client.Buck2.CabalToBuck') -
-      -- real Cabal defines @VERSION_x@\/@MIN_VERSION_x@ for a package's
-      -- whole build-depends closure using exactly these solver-resolved
-      -- versions, not just whatever version range the @.cabal@ file
-      -- itself names.
-      let pkgVersions =
-            Map.fromList
-              [ (packageName pid, packageVersion pid)
-              | pkg <- InstallPlan.toList elaboratedPlanOriginal
-              , let pid = InstallPlan.foldPlanPackage packageId packageId pkg
-              ]
+
+      -- A real, correctly-versioned 'InstalledPackageIndex' covering the
+      -- whole resolved dependency closure - 'generatePrebuilt' already
+      -- did the work of finding and parsing every real @.conf@ file, so
+      -- this is free (no second walk of the store\/global\/inplace
+      -- package dbs).
+      let installedIndex :: InstalledPackageIndex
+          installedIndex = PackageIndex.fromList resolvedDeps
+
+      -- A real 'LocalBuildInfo' for every local (or quasi-local, per
+      -- 'localPkgs's own comment above) *component* - built the exact
+      -- same way "Distribution.Client.ProjectBuilding.UnpackedPackage"
+      -- builds one for a real build, via
+      -- "Distribution.Client.InLibrary" (an in-process, no-subprocess
+      -- reimplementation of Setup.hs's own configure logic that calls
+      -- straight into the real 'Distribution.Simple.Configure.configureFinal'
+      -- - so the result is exactly what a real @Setup configure@ would
+      -- produce, not a hand-approximation of it). This is what lets
+      -- "Distribution.Client.Buck2.CabalToBuck" call Cabal's own
+      -- @generateCabalMacrosHeader@\/@generatePathsModule@ directly
+      -- instead of reimplementing pieces of them by hand (a real
+      -- maintenance risk otherwise - see buck2.md's own note on this).
+      -- Confirmed via reading 'InLibrary.configure''s own source that
+      -- this is a pure in-memory computation: nothing in it calls
+      -- @writePersistBuildConfig@ or otherwise writes to
+      -- @dist-newstyle@, so this doesn't give local packages a second,
+      -- redundant "configured" state on disk.
+      --
+      -- Processed in dependency order ('InstallPlan.reverseTopologicalOrder'
+      -- - despite the name, dependencies first - not the arbitrary order
+      -- 'InstallPlan.toList' returns), threading a *growing*
+      -- 'InstalledPackageIndex' through the fold: a local package that
+      -- build-depends on another local package (e.g. almost everything
+      -- here depends on the local @Cabal@ library) needs that
+      -- dependency's own real 'UnitId' resolvable in the index passed to
+      -- 'localBuildInfoFor' - exactly the role "Note [Per-project
+      -- InstalledPackageIndex]" in
+      -- "Distribution.Client.ProjectBuilding" describes for a real
+      -- build's own incrementally-registered index - so
+      -- 'registerLocalLibrary' below adds each library component's own
+      -- (unbuilt, in-place) 'InstalledPackageInfo' as soon as it's
+      -- configured, before moving on to whatever depends on it.
+      (componentLBIs, _) <-
+        foldM
+          ( \(cmap, idx) elab -> do
+              lbi <- localBuildInfoFor verbosity (distDirLayout baseCtx) elaboratedPlanOriginal elaboratedShared idx elab
+              case elabComponentName elab of
+                Nothing -> return (cmap, idx)
+                Just cname -> do
+                  idx' <- registerLocalLibrary verbosity lbi (elabPkgDescription elab) cname idx
+                  return (Map.insert (packageName (elabPkgDescription elab), cname) lbi cmap, idx')
+          )
+          (Map.empty, installedIndex)
+          [ elab
+          | InstallPlan.Configured elab <- InstallPlan.reverseTopologicalOrder elaboratedPlanOriginal
+          , elabLocalToProject elab || elabBuildStyle elab /= BuildAndInstall
+          ]
+
       -- Per-component elaboration gives each local package one
       -- 'ElaboratedConfiguredPackage' per component (library, executable,
       -- ...), all sharing the same directory and the same (whole-package)
       -- 'PackageDescription' - so without this, a package with N
       -- buildable components would get regenerated N times over.
-      generateAllPackages verbosity projectRoot pkgVersions (nubBy ((==) `on` fst) localPkgs)
+      generateAllPackages verbosity projectRoot componentLBIs (nubBy ((==) `on` fst) localPkgs)
 
       notice verbosity $
         unlines
@@ -225,6 +296,100 @@ packageSourceDir verbosity distDirLayout elab
       RemoteSourceRepoPackage{} -> dieWithException verbosity (Buck2NonLocalPackageLocation (prettyShow (packageId elab)))
   where
     unpackedPath = distUnpackedSrcDirectory distDirLayout (elabPkgSourceId elab)
+
+-- | A real 'LocalBuildInfo' for one local (or quasi-local) *component*,
+-- computed the same way a real build does - via
+-- "Distribution.Client.InLibrary", which wraps Cabal's own
+-- 'Distribution.Simple.Configure.configureFinal' - rather than
+-- hand-assembling the pieces 'Distribution.Simple.Build.Macros.
+-- generateCabalMacrosHeader'\/'Distribution.Simple.Build.PathsModule.
+-- generatePathsModule' need. @elab@'s own 'elabPkgOrComp' determines
+-- which single component gets configured here (matching real Cabal:
+-- per-component elaboration means one 'ElaboratedConfiguredPackage' -
+-- and so one call here - per component, not per package).
+localBuildInfoFor
+  :: Verbosity
+  -> DistDirLayout
+  -> ElaboratedInstallPlan
+  -> ElaboratedSharedConfig
+  -> InstalledPackageIndex
+  -> ElaboratedConfiguredPackage
+  -> IO LocalBuildInfo
+localBuildInfoFor verbosity distDirLayout plan shared ipi elab = do
+  -- Real Cabal's own 'InLibrary.configure' falls back to *searching* the
+  -- working directory for a @<pkgname>.cabal@ file whenever
+  -- 'Cabal.configCabalFilePath' isn't set (see its own use of
+  -- 'tryFindPackageDesc') - so this has to be the package's own source
+  -- directory, matching 'setupHsScriptOptions''s own @srcdir@ in the
+  -- real build path ("Distribution.Client.ProjectBuilding.UnpackedPackage"),
+  -- not the buck2 command's actual cwd (the project root), or this fails
+  -- outright with "No cabal file found" for every package but one that
+  -- happens to be sitting at the project root itself.
+  pkgDir <- packageSourceDir verbosity distDirLayout elab
+  let verbHandles = defaultVerbosityHandles
+      -- Builtin preprocessors (alex, happy, hsc2hs, ...) restored as
+      -- known-but-unconfigured programs, and the compiler's own
+      -- already-configured programs - the same starting point a real
+      -- build's own 'Distribution.Client.SetupWrapper' constructs (see
+      -- its own comment "Note [Constructing the ProgramDb]") - plus
+      -- 'elabExeDependencyPaths'\/'elabProgramPathExtra' prepended onto
+      -- its search path. That part isn't optional the way the rest of
+      -- "Note [Constructing the ProgramDb]"'s extra layering is: a
+      -- component with e.g. @build-tool-depends: alex:alex@ needs
+      -- 'InLibrary.configure' below to be able to find *this* build's
+      -- own just-built @alex@ (never on a bare @$PATH@ - it only exists
+      -- under @dist-newstyle@) and query its version, the same way real
+      -- Cabal's own subprocess-based configure does via
+      -- 'setupHsScriptOptions''s @useExtraPathEnv@ - just via a search
+      -- path prepend instead of a subprocess's environment, since this
+      -- runs in-process.
+      progDb =
+        prependProgramSearchPathNoLogging
+          (elabExeDependencyPaths elab ++ elabProgramPathExtra elab)
+          []
+          (restoreProgramDb builtinPrograms (pkgConfigCompilerProgs shared))
+      buildType = PD.buildType (elabPkgDescription elab)
+      inputs =
+        InLibrary.libraryConfigureInputsFromElabPackage
+          verbHandles
+          buildType
+          progDb
+          shared
+          (ReadyPackage elab)
+          ipi
+          []
+      builddir = makeSymbolicPath (distBuildDirectory distDirLayout (elabDistDirParams shared elab) </> "build")
+      commonFlags = setupHsCommonFlags verbosity (Just (makeSymbolicPath pkgDir)) builddir [] False
+  cfg <-
+    setupHsConfigureFlags
+      (fmap makeSymbolicPath . canonicalizePath)
+      plan
+      (ReadyPackage elab)
+      shared
+      commonFlags
+  InLibrary.configure inputs cfg
+
+-- | If @cname@ names a library component, produce the real, in-place
+-- 'InstalledPackageInfo' for it - the same info a real @Setup register@
+-- would write to @package.conf.inplace@ after building it, without
+-- actually writing anything anywhere - and add it to @idx@. Real
+-- Cabal's own 'generateRegistrationInfo', in its in-place branch, needs
+-- no built object code to do this: an in-place package's ABI hash is
+-- always the fixed placeholder @"inplace"@ (see its own haddock), so
+-- this is safe to call immediately after 'localBuildInfoFor' configures
+-- the component, before anything is actually compiled.
+--
+-- Every other kind of component (executable\/test-suite\/benchmark) is
+-- skipped: nothing ever depends on one of those by 'UnitId', so they
+-- have nothing to contribute to the index.
+registerLocalLibrary :: Verbosity -> LocalBuildInfo -> PackageDescription -> ComponentName -> InstalledPackageIndex -> IO InstalledPackageIndex
+registerLocalLibrary verbosity lbi pkgDesc cname idx = case cname of
+  CLibName ln
+    | Just lib <- listToMaybe [l | l <- PD.allLibraries pkgDesc, PD.libName l == ln]
+    , (clbi : _) <- componentNameCLBIs lbi cname -> do
+        ipi <- generateRegistrationInfo verbosity pkgDesc lib lbi clbi True (relocatable lbi) (distPrefLBI lbi) GlobalPackageDB
+        return (PackageIndex.insert ipi idx)
+  _ -> return idx
 
 -- | Like 'pruneInstallPlanToDependencies', but when excluding every
 -- selected target would leave a dangling edge, keep exactly the targets

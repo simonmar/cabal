@@ -106,7 +106,14 @@ import Distribution.Client.Buck2.CabalToBuck (libTargetName)
 import Distribution.Client.Buck2.Starlark
 
 -- | Generate\/refresh @third-party\/haskell@ from the dependency closure
--- of an already-built, already-pruned install plan.
+-- of an already-built, already-pruned install plan. Returns the real,
+-- already-parsed 'InstalledPackageInfo' for every resolved dependency
+-- (local\/quasi-local packages included, per 'localUnitIds's own
+-- haddock) - callers that need a real 'Distribution.Simple.PackageIndex.
+-- InstalledPackageIndex' (e.g. to build a genuine 'LocalBuildInfo' via
+-- "Distribution.Client.InLibrary", the way "Distribution.Client.CmdBuck2"
+-- does) can build one directly from this via 'PackageIndex.fromList'
+-- without a second, independent walk of the same @.conf@ files.
 generatePrebuilt
   :: Verbosity
   -> FilePath
@@ -123,7 +130,7 @@ generatePrebuilt
   -- it - which is filtered back out below, since a kept-in local package
   -- already gets a real 'haskell_library()' from
   -- "Distribution.Client.Buck2.Generate", not a prebuilt one here.
-  -> IO ()
+  -> IO [InstalledPackageInfo]
 generatePrebuilt verbosity projectRoot cabalDirLayout distDirLayout shared depsPlan = do
   ghcProg <-
     maybe (dieWithException verbosity Buck2NoGhcProgram) return $
@@ -261,6 +268,8 @@ generatePrebuilt verbosity projectRoot cabalDirLayout distDirLayout shared depsP
   writeBuckFile targetDir paths packages
 
   writeToolsFile targetDir ghcVersionStr ghcDynamic alexPath happyPath
+
+  return (map rpInfo allResolved)
 
 -- | The repo-relative anchors every generated path is expressed against:
 -- the symlinks 'generatePrebuilt' just created, plus the GHC version

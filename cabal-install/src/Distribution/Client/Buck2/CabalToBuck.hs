@@ -25,7 +25,7 @@ import qualified Data.Set as Set
 import qualified Distribution.Compat.NonEmptySet as NES
 import Distribution.Compiler (CompilerFlavor (GHC))
 import qualified Distribution.ModuleName as ModuleName
-import Distribution.Package (PackageIdentifier (..), packageName, packageVersion)
+import Distribution.Package (packageName)
 import Distribution.PackageDescription
   ( BuildInfo
   , Executable (exeName, modulePath)
@@ -49,17 +49,20 @@ import Distribution.PackageDescription
   , pkgconfigDepends
   , targetBuildDepends
   )
-import Distribution.Types.Component (Component (..), componentBuildInfo)
+import Distribution.Types.Component (Component (..), componentBuildInfo, componentName)
+import Distribution.Types.ComponentLocalBuildInfo (ComponentLocalBuildInfo)
+import Distribution.Types.ComponentName (ComponentName)
 import Distribution.Types.Dependency (depLibraries, depPkgName)
+import Distribution.Types.LocalBuildInfo (LocalBuildInfo, componentNameCLBIs)
 import Distribution.Types.PackageName (PackageName, unPackageName)
 import Distribution.Types.PkgconfigDependency (PkgconfigDependency (..))
 import Distribution.Types.PkgconfigName (unPkgconfigName)
 import Distribution.Types.UnqualComponentName (unUnqualComponentName)
 import Distribution.Utils.Path (getSymbolicPath)
 import Distribution.Verbosity (VerbosityFlags (vLevel), VerbosityLevel (Silent), modifyVerbosityFlags)
-import Distribution.Version (Version, versionNumbers)
 
-import Distribution.Simple.Build.Macros (generatePackageVersionMacros)
+import Distribution.Simple.Build.Macros (generateCabalMacrosHeader)
+import Distribution.Simple.Build.PathsModule (generatePathsModule)
 import Distribution.Simple.BuildPaths (autogenPathsModuleName)
 import Distribution.Simple.Utils (ordNub, warn)
 
@@ -100,21 +103,21 @@ generatePackageTargets
   -- root) - used only to locate the generated @cabal_macros.h@ from the
   -- compile action's working directory (the project root), distinct from
   -- @pkgDir@ itself (a real filesystem path, used for everything else).
-  -> Map PackageName Version
+  -> Map (PackageName, ComponentName) LocalBuildInfo
   -> FilePath
   -> PackageDescription
   -> IO PackageTargets
-generatePackageTargets verbosity localIndex rootRelPkgDir pkgVersions pkgDir pkgDesc = do
+generatePackageTargets verbosity localIndex rootRelPkgDir componentLBIs pkgDir pkgDesc = do
   -- Computed up front (silently - see 'skippedLibraries's own haddock),
   -- so every component below - regardless of its own textual position
   -- in the .cabal file relative to the library it depends on - already
   -- knows which of this package's own libraries won't get a rule, and
   -- can skip itself too instead of emitting a dangling dependency edge.
-  skippedLibs <- skippedLibraries verbosity pkgDesc pkgDir
+  skippedLibs <- skippedLibraries verbosity pkgDesc pkgDir componentLBIs
   targets <-
     mconcat
       <$> traverse
-        (generateComponent verbosity localIndex rootRelPkgDir pkgVersions pkgDir pkgDesc skippedLibs)
+        (generateComponent verbosity localIndex rootRelPkgDir componentLBIs pkgDir pkgDesc skippedLibs)
         (pkgBuildableComponents pkgDesc)
   return targets{ptCalls = dedupPkgconfigCalls (ptCalls targets)}
 
@@ -133,16 +136,28 @@ generatePackageTargets verbosity localIndex rootRelPkgDir pkgVersions pkgDir pkg
 -- same resolution 'generateComponent' below will redo for real (and
 -- warn about) when it reaches that library component itself - this
 -- pass exists only to know the *outcome* early, not to report it twice.
-skippedLibraries :: Verbosity -> PackageDescription -> FilePath -> IO (Set LibraryName)
-skippedLibraries verbosity pkgDesc pkgDir =
+skippedLibraries :: Verbosity -> PackageDescription -> FilePath -> Map (PackageName, ComponentName) LocalBuildInfo -> IO (Set LibraryName)
+skippedLibraries verbosity pkgDesc pkgDir componentLBIs =
   Set.fromList . catMaybes
     <$> traverse checkLib [lib | CLib lib <- pkgBuildableComponents pkgDesc]
   where
     quiet = modifyVerbosityFlags (\vf -> vf{vLevel = Silent}) verbosity
     checkLib lib = do
       let bi = libBuildInfo lib
-      msrcs <- resolveModules quiet pkgDesc pkgDir bi (exposedModules lib ++ otherModules bi)
+      msrcs <- resolveModules quiet pkgDesc (lbiClbiFor pkgDesc componentLBIs (CLib lib)) pkgDir bi (exposedModules lib ++ otherModules bi)
       return $ if isNothing msrcs then Just (libName lib) else Nothing
+
+-- | Look up a component's real, Cabal-computed 'LocalBuildInfo' (from
+-- "Distribution.Client.CmdBuck2") plus its own 'ComponentLocalBuildInfo'
+-- within it (via 'componentNameCLBIs') - 'Nothing' if either lookup fails
+-- (e.g. a component that isn't part of the elaborated build plan, such as
+-- a test-suite when tests aren't enabled), in which case callers skip the
+-- component rather than emit a rule built from fabricated data.
+lbiClbiFor :: PackageDescription -> Map (PackageName, ComponentName) LocalBuildInfo -> Component -> Maybe (LocalBuildInfo, ComponentLocalBuildInfo)
+lbiClbiFor pkgDesc componentLBIs comp = do
+  lbi <- Map.lookup (packageName pkgDesc, componentName comp) componentLBIs
+  clbi <- listToMaybe (componentNameCLBIs lbi (componentName comp))
+  return (lbi, clbi)
 
 -- | Two components of the *same* package sharing a @pkgconfig-depends@
 -- each generate their own @external_pkgconfig_library()@ call (from
@@ -168,13 +183,13 @@ generateComponent
   :: Verbosity
   -> LocalPackageIndex
   -> FilePath
-  -> Map PackageName Version
+  -> Map (PackageName, ComponentName) LocalBuildInfo
   -> FilePath
   -> PackageDescription
   -> Set LibraryName
   -> Component
   -> IO PackageTargets
-generateComponent verbosity localIndex rootRelPkgDir pkgVersions pkgDir pkgDesc skippedLibs comp = case comp of
+generateComponent verbosity localIndex rootRelPkgDir componentLBIs pkgDir pkgDesc skippedLibs comp = case comp of
   CLib lib -> library (libTargetName (packageName pkgDesc) (libName lib)) lib
   CExe exe -> ifNotOnSkippedLib (componentBuildInfo comp) (unUnqualComponentName (exeName exe)) "executable" $ executable exe
   CTest test -> ifNotOnSkippedLib (componentBuildInfo comp) (unUnqualComponentName (testName test)) "test-suite" $ testSuite test
@@ -206,95 +221,103 @@ generateComponent verbosity localIndex rootRelPkgDir pkgVersions pkgDir pkgDesc 
             )
         [] -> act
 
-    library targetName lib = do
-      let bi = libBuildInfo lib
-      msrcs <- resolveModules verbosity pkgDesc pkgDir bi (exposedModules lib ++ otherModules bi)
-      case msrcs of
-        Nothing -> skip ("library " ++ targetName ++ " (couldn't resolve all its modules)")
-        Just srcs -> do
-          (cxxLoads, cxxDeps, cxxCalls) <- cxxLibraryFor localIndex pkgDir targetName bi
-          macrosFlags <- macrosFlagsArg pkgDir rootRelPkgDir targetName pkgDesc pkgVersions bi
-          let (pkgs, deps) = classifyDeps localIndex bi
-              hlCall =
-                call
-                  "haskell_library"
-                  ( [ ("name", str targetName)
-                    , ("srcs", VDict srcs)
-                    ]
-                      ++ compilerFlagsArg macrosFlags bi
-                      ++ exportedLinkerFlagsArg bi
-                      ++ optionalListArg "packages" pkgs
-                      ++ optionalListArg "deps" (deps ++ cxxDeps)
-                      ++ [("visibility", strList ["PUBLIC"])]
-                  )
-          return $
-            PackageTargets
-              (("//buck2:haskell.bzl", ["haskell_library"]) : cxxLoads)
-              (cxxCalls ++ [hlCall])
+    library targetName lib = case lbiClbiFor pkgDesc componentLBIs comp of
+      Nothing -> skip ("library " ++ targetName ++ " (no LocalBuildInfo found for it in the elaborated build plan)")
+      Just (lbi, clbi) -> do
+        let bi = libBuildInfo lib
+        msrcs <- resolveModules verbosity pkgDesc (Just (lbi, clbi)) pkgDir bi (exposedModules lib ++ otherModules bi)
+        case msrcs of
+          Nothing -> skip ("library " ++ targetName ++ " (couldn't resolve all its modules)")
+          Just srcs -> do
+            (cxxLoads, cxxDeps, cxxCalls) <- cxxLibraryFor localIndex pkgDir targetName bi
+            macrosFlags <- macrosFlagsArg pkgDir rootRelPkgDir targetName pkgDesc lbi clbi
+            let (pkgs, deps) = classifyDeps localIndex bi
+                hlCall =
+                  call
+                    "haskell_library"
+                    ( [ ("name", str targetName)
+                      , ("srcs", VDict srcs)
+                      ]
+                        ++ compilerFlagsArg macrosFlags bi
+                        ++ exportedLinkerFlagsArg bi
+                        ++ optionalListArg "packages" pkgs
+                        ++ optionalListArg "deps" (deps ++ cxxDeps)
+                        ++ [("visibility", strList ["PUBLIC"])]
+                    )
+            return $
+              PackageTargets
+                (("//buck2:haskell.bzl", ["haskell_library"]) : cxxLoads)
+                (cxxCalls ++ [hlCall])
 
-    executable exe = do
-      let bi = componentBuildInfo (CExe exe)
-          targetName = unUnqualComponentName (exeName exe)
-      mmainSrc <- resolveMainIs verbosity pkgDir bi (getSymbolicPath (modulePath exe))
-      motherSrcs <- resolveModules verbosity pkgDesc pkgDir bi (otherModules bi)
-      case (mmainSrc, motherSrcs) of
-        (Just mainSrc, Just otherSrcs) -> do
-          (cxxLoads, cxxDeps, cxxCalls) <- cxxLibraryFor localIndex pkgDir targetName bi
-          macrosFlags <- macrosFlagsArg pkgDir rootRelPkgDir targetName pkgDesc pkgVersions bi
-          let (pkgs, deps) = classifyDeps localIndex bi
-              binCall =
-                call
-                  "haskell_binary"
-                  ( [ ("name", str targetName)
-                    , ("srcs", VDict (("Main.hs", str mainSrc) : otherSrcs))
-                    ]
-                      ++ compilerFlagsArg macrosFlags bi
-                      ++ linkerFlagsArg bi
-                      ++ optionalListArg "packages" pkgs
-                      ++ optionalListArg "deps" (deps ++ cxxDeps)
-                      ++ [("visibility", strList ["PUBLIC"])]
-                  )
-          return $
-            PackageTargets
-              (("//buck2:haskell.bzl", ["haskell_binary"]) : cxxLoads)
-              (cxxCalls ++ [binCall])
-        _ -> skip ("executable " ++ targetName ++ " (couldn't resolve all its modules)")
-
-    testSuite test = case testInterface test of
-      TestSuiteExeV10 _ver mainIs -> do
-        let bi = componentBuildInfo (CTest test)
-            targetName = unUnqualComponentName (testName test)
-        mmainSrc <- resolveMainIs verbosity pkgDir bi (getSymbolicPath mainIs)
-        motherSrcs <- resolveModules verbosity pkgDesc pkgDir bi (otherModules bi)
+    executable exe = case lbiClbiFor pkgDesc componentLBIs comp of
+      Nothing -> skip ("executable " ++ targetName ++ " (no LocalBuildInfo found for it in the elaborated build plan)")
+      Just (lbi, clbi) -> do
+        mmainSrc <- resolveMainIs verbosity pkgDir bi (getSymbolicPath (modulePath exe))
+        motherSrcs <- resolveModules verbosity pkgDesc (Just (lbi, clbi)) pkgDir bi (otherModules bi)
         case (mmainSrc, motherSrcs) of
           (Just mainSrc, Just otherSrcs) -> do
             (cxxLoads, cxxDeps, cxxCalls) <- cxxLibraryFor localIndex pkgDir targetName bi
-            macrosFlags <- macrosFlagsArg pkgDir rootRelPkgDir targetName pkgDesc pkgVersions bi
+            macrosFlags <- macrosFlagsArg pkgDir rootRelPkgDir targetName pkgDesc lbi clbi
             let (pkgs, deps) = classifyDeps localIndex bi
-                testCall =
+                binCall =
                   call
-                    "haskell_test"
+                    "haskell_binary"
                     ( [ ("name", str targetName)
                       , ("srcs", VDict (("Main.hs", str mainSrc) : otherSrcs))
-                      , -- Real `cabal test` always runs a test-suite with its
-                        -- cwd set to the package's own directory - matched
-                        -- here so a test that reads its own fixture files by
-                        -- a package-relative path (extremely common) works
-                        -- the same way under buck2 (see haskell_test()'s own
-                        -- haddock in buck2/haskell.bzl for why this needs a
-                        -- generated wrapper, not just a plain attr).
-                        ("cwd", str rootRelPkgDir)
                       ]
                         ++ compilerFlagsArg macrosFlags bi
                         ++ linkerFlagsArg bi
                         ++ optionalListArg "packages" pkgs
                         ++ optionalListArg "deps" (deps ++ cxxDeps)
+                        ++ [("visibility", strList ["PUBLIC"])]
                     )
             return $
               PackageTargets
-                (("//buck2:haskell.bzl", ["haskell_test"]) : cxxLoads)
-                (cxxCalls ++ [testCall])
-          _ -> skip ("test-suite " ++ targetName ++ " (couldn't resolve all its modules)")
+                (("//buck2:haskell.bzl", ["haskell_binary"]) : cxxLoads)
+                (cxxCalls ++ [binCall])
+          _ -> skip ("executable " ++ targetName ++ " (couldn't resolve all its modules)")
+      where
+        bi = componentBuildInfo (CExe exe)
+        targetName = unUnqualComponentName (exeName exe)
+
+    testSuite test = case testInterface test of
+      TestSuiteExeV10 _ver mainIs -> case lbiClbiFor pkgDesc componentLBIs comp of
+        Nothing -> skip ("test-suite " ++ targetName ++ " (no LocalBuildInfo found for it in the elaborated build plan)")
+        Just (lbi, clbi) -> do
+          mmainSrc <- resolveMainIs verbosity pkgDir bi (getSymbolicPath mainIs)
+          motherSrcs <- resolveModules verbosity pkgDesc (Just (lbi, clbi)) pkgDir bi (otherModules bi)
+          case (mmainSrc, motherSrcs) of
+            (Just mainSrc, Just otherSrcs) -> do
+              (cxxLoads, cxxDeps, cxxCalls) <- cxxLibraryFor localIndex pkgDir targetName bi
+              macrosFlags <- macrosFlagsArg pkgDir rootRelPkgDir targetName pkgDesc lbi clbi
+              let (pkgs, deps) = classifyDeps localIndex bi
+                  testCall =
+                    call
+                      "haskell_test"
+                      ( [ ("name", str targetName)
+                        , ("srcs", VDict (("Main.hs", str mainSrc) : otherSrcs))
+                        , -- Real `cabal test` always runs a test-suite with its
+                          -- cwd set to the package's own directory - matched
+                          -- here so a test that reads its own fixture files by
+                          -- a package-relative path (extremely common) works
+                          -- the same way under buck2 (see haskell_test()'s own
+                          -- haddock in buck2/haskell.bzl for why this needs a
+                          -- generated wrapper, not just a plain attr).
+                          ("cwd", str rootRelPkgDir)
+                        ]
+                          ++ compilerFlagsArg macrosFlags bi
+                          ++ linkerFlagsArg bi
+                          ++ optionalListArg "packages" pkgs
+                          ++ optionalListArg "deps" (deps ++ cxxDeps)
+                      )
+              return $
+                PackageTargets
+                  (("//buck2:haskell.bzl", ["haskell_test"]) : cxxLoads)
+                  (cxxCalls ++ [testCall])
+            _ -> skip ("test-suite " ++ targetName ++ " (couldn't resolve all its modules)")
+        where
+          bi = componentBuildInfo (CTest test)
+          targetName = unUnqualComponentName (testName test)
       _ ->
         skip
           ( "test-suite "
@@ -350,46 +373,53 @@ exportedLinkerFlagsArg bi = optionalListArg "exported_linker_flags" ["-l" ++ lib
 linkerFlagsArg :: BuildInfo -> [(String, Value)]
 linkerFlagsArg bi = optionalListArg "linker_flags" (["-l" ++ lib | lib <- extraLibs bi] ++ hcOptions GHC bi)
 
--- | Writes this component's @cabal_macros.h@ (real Cabal's own
--- 'generatePackageVersionMacros' - so @VERSION_x@\/@MIN_VERSION_x@ for
--- every direct build-dependency, using the solver-resolved version, are
--- byte-for-byte what a plain @cabal build@ would generate) to a real file
--- next to the package's own sources, and returns the @-optP-include
--- -optP<path>@ pair that makes GHC's C preprocessor implicitly include it
--- - exactly how real Cabal wires this up, just generated ahead of time
--- instead of by Setup.hs at configure time. Written unconditionally, like
--- real Cabal: harmless for a component that never enables CPP (the flags
--- only matter if\/when cpp actually runs).
+-- | Writes this component's @cabal_macros.h@ to a real file next to the
+-- package's own sources, and returns the @-optP-include -optP<path>@
+-- pair that makes GHC's C preprocessor implicitly include it - exactly
+-- how real Cabal wires this up, just generated ahead of time instead of
+-- by Setup.hs at configure time. Written unconditionally, like real
+-- Cabal: harmless for a component that never enables CPP (the flags only
+-- matter if\/when cpp actually runs).
 --
--- The file has to be a real, separately-included header rather than
--- e.g. plain @-D@ flags on the command line: @MIN_VERSION_x@ is a
--- function-like macro, and cpp's own @-D 'NAME(args)=body'@ form is both
--- far more fragile to generate correctly (nested commas\/parens through
--- Starlark string escaping) and gives up matching real Cabal's output
--- verbatim - this way the exact same 'generatePackageVersionMacros' Cabal
--- itself uses does the formatting.
+-- The header's actual content comes straight from real Cabal's own
+-- 'generateCabalMacrosHeader' - given this component's real
+-- 'LocalBuildInfo'\/'ComponentLocalBuildInfo' (see 'lbiClbiFor'\/
+-- "Distribution.Client.CmdBuck2"), it's byte-for-byte what a plain
+-- @cabal build@ would generate: @VERSION_x@\/@MIN_VERSION_x@ for every
+-- dependency, plus @CURRENT_PACKAGE_KEY@\/@CURRENT_COMPONENT_ID@ (always
+-- defined by real Cabal, for every package with a library - a generic
+-- self-identification idiom any package's own code can use, the same
+-- way @MIN_VERSION_x@ lets it query a dependency). Not merely cosmetic:
+-- the @Cabal@ library's own @Distribution.Simple.Utils.cabalVersion@
+-- ("We only get our own version number when we're building with
+-- ourselves") reads its real version from @Paths_Cabal@ *only* behind
+-- @#ifdef CURRENT_PACKAGE_KEY@, silently falling back to a hardcoded
+-- @Version [3,0]@ "used when bootstrapping" otherwise - and
+-- cabal-install's own solver derives a global @setup.Cabal@ upper bound
+-- from that value, so leaving it undefined broke resolving *any other*
+-- project's @custom-setup: Cabal >= 3.6@ (or higher) requirement against
+-- a buck2-built cabal-install outright (confirmed: this is exactly what
+-- broke resolving Glean's glean-clang package).
+--
+-- Has to be a real, separately-included header rather than plain @-D@
+-- flags on the command line: @MIN_VERSION_x@ is a function-like macro,
+-- and cpp's own @-D 'NAME(args)=body'@ form is both far more fragile to
+-- generate correctly (nested commas\/parens through Starlark string
+-- escaping) and gives up matching real Cabal's output verbatim.
 --
 -- Not buck2-tracked as a real action input (unlike @srcs@): buck2's local
 -- execution here runs with the whole checkout on disk and the project
 -- root as its cwd (confirmed by every other repo-root-relative path
 -- already in a generated @compiler_flags@\/@-package-db@), the same way
--- 'writePathsModule''s generated @Paths_x.hs@ stand-in already relies on,
--- so a plain path written straight into the package directory and
--- resolved root-relative here works the same way.
-macrosFlagsArg :: FilePath -> FilePath -> String -> PackageDescription -> Map PackageName Version -> BuildInfo -> IO [String]
-macrosFlagsArg pkgDir rootRelPkgDir targetName pkgDesc pkgVersions bi = do
+-- 'writePathsModule''s generated @Paths_x.hs@ already relies on, so a
+-- plain path written straight into the package directory and resolved
+-- root-relative here works the same way.
+macrosFlagsArg :: FilePath -> FilePath -> String -> PackageDescription -> LocalBuildInfo -> ComponentLocalBuildInfo -> IO [String]
+macrosFlagsArg pkgDir rootRelPkgDir targetName pkgDesc lbi clbi = do
   createDirectoryIfMissing True headerDir
-  writeFile headerPath headerText
+  writeFile headerPath (generateCabalMacrosHeader pkgDesc lbi clbi)
   return ["-optP-include", "-optP" ++ (rootRelPkgDir </> headerRelPath)]
   where
-    depPids =
-      ordNub
-        [ PackageIdentifier pn v
-        | d <- targetBuildDepends bi
-        , let pn = depPkgName d
-        , Just v <- [Map.lookup pn pkgVersions]
-        ]
-    headerText = generatePackageVersionMacros (packageVersion pkgDesc) depPids
     headerRelPath = "cabal-buck2" </> "autogen" </> targetName </> "cabal_macros.h"
     headerDir = pkgDir </> "cabal-buck2" </> "autogen" </> targetName
     headerPath = pkgDir </> headerRelPath
@@ -459,7 +489,11 @@ localTargetLabel dir targetName = "//" ++ (if dir == "." then "" else dir) ++ ":
 -- directory. The package's @Paths_<pkg>@ autogen module (if listed) is
 -- special-cased: no such file exists anywhere - Cabal's own Setup.hs
 -- generates it fresh on every real build - so 'writePathsModule' stands
--- one in ourselves rather than searching for it.
+-- one in ourselves rather than searching for it, which needs this
+-- component's real 'LocalBuildInfo'\/'ComponentLocalBuildInfo' (see
+-- 'lbiClbiFor') the same way 'macrosFlagsArg' does; 'Nothing' here (no
+-- LBI available for this component) fails this module's own resolution,
+-- same as a missing source file would.
 --
 -- 'Nothing' if *any* module couldn't be resolved - the caller skips the
 -- whole component in that case, rather than emitting a rule that
@@ -468,15 +502,20 @@ localTargetLabel dir targetName = "//" ++ (if dir == "." then "" else dir) ++ ":
 -- (since a @buck2 build //...@ evaluates every @BUCK@ file up front)
 -- would otherwise take the *entire* build down over one unresolvable
 -- module in one component of one package.
-resolveModules :: Verbosity -> PackageDescription -> FilePath -> BuildInfo -> [ModuleName.ModuleName] -> IO (Maybe [(String, Value)])
-resolveModules verbosity pkgDesc pkgDir bi mods =
-  sequenceA <$> traverse (resolveOne verbosity pkgDesc pkgDir (sourceDirs bi)) mods
+resolveModules :: Verbosity -> PackageDescription -> Maybe (LocalBuildInfo, ComponentLocalBuildInfo) -> FilePath -> BuildInfo -> [ModuleName.ModuleName] -> IO (Maybe [(String, Value)])
+resolveModules verbosity pkgDesc mlbiClbi pkgDir bi mods =
+  sequenceA <$> traverse (resolveOne verbosity pkgDesc mlbiClbi pkgDir (sourceDirs bi)) mods
 
-resolveOne :: Verbosity -> PackageDescription -> FilePath -> [FilePath] -> ModuleName.ModuleName -> IO (Maybe (String, Value))
-resolveOne verbosity pkgDesc pkgDir dirs m
-  | m == autogenPathsModuleName pkgDesc = do
-      real <- writePathsModule pkgDir pkgDesc m
-      return (Just (ModuleName.toFilePath m <.> "hs", str real))
+resolveOne :: Verbosity -> PackageDescription -> Maybe (LocalBuildInfo, ComponentLocalBuildInfo) -> FilePath -> [FilePath] -> ModuleName.ModuleName -> IO (Maybe (String, Value))
+resolveOne verbosity pkgDesc mlbiClbi pkgDir dirs m
+  | m == autogenPathsModuleName pkgDesc = case mlbiClbi of
+      Nothing -> do
+        warn verbosity $
+          "cabal buck2: couldn't generate " ++ prettyShow m ++ " (no LocalBuildInfo available for this component)"
+        return Nothing
+      Just (lbi, clbi) -> do
+        real <- writePathsModule pkgDir pkgDesc lbi clbi m
+        return (Just (ModuleName.toFilePath m <.> "hs", str real))
   | otherwise = do
       let modPath = ModuleName.toFilePath m
           hsPath = modPath <.> "hs"
@@ -496,52 +535,20 @@ resolveOne verbosity pkgDesc pkgDir dirs m
           return Nothing
 
 -- | Cabal's own Setup.hs generates a @Paths_\<pkg\>@ module fresh at
--- configure\/build time (giving @version@\/@getDataFileName@\/etc - see
--- 'Distribution.Simple.Build.PathsModule') - no real source file for it
--- exists anywhere to find. Writing a real, buck2-buildable stand-in here
--- (always regenerated, same as 'BUCK.cabal.bzl' - it's derived purely
--- from the package's own name\/version) is simpler than reimplementing
--- Cabal's actual generator, which needs a full 'LocalBuildInfo' (install
--- dirs, relocatability, ...) buck2 has no equivalent of. Unlike Cabal's
--- own version, the install-dir getters here aren't meaningful under
--- buck2 (there's no "install prefix" concept) - only 'version' carries
--- real information.
-writePathsModule :: FilePath -> PackageDescription -> ModuleName.ModuleName -> IO String
-writePathsModule pkgDir pkgDesc m = do
+-- configure\/build time (giving @version@\/@getDataFileName@\/etc) - no
+-- real source file for it exists anywhere to find. Written here from
+-- real Cabal's own 'generatePathsModule' (given this component's real
+-- 'LocalBuildInfo'\/'ComponentLocalBuildInfo' - see 'lbiClbiFor'), so
+-- install-dir\/relocatability logic matches a plain @cabal build@
+-- exactly, instead of the hand-rolled @return "."@ stand-in this used to
+-- be before a real 'LocalBuildInfo' was available here.
+writePathsModule :: FilePath -> PackageDescription -> LocalBuildInfo -> ComponentLocalBuildInfo -> ModuleName.ModuleName -> IO String
+writePathsModule pkgDir pkgDesc lbi clbi m = do
   createDirectoryIfMissing True (pkgDir </> "cabal-buck2" </> "autogen")
-  writeFile (pkgDir </> relPath) contents
+  writeFile (pkgDir </> relPath) (generatePathsModule pkgDesc lbi clbi)
   return relPath
   where
-    fileName = ModuleName.toFilePath m <.> "hs"
-    relPath = "cabal-buck2" </> "autogen" </> fileName
-    modName = prettyShow m
-    contents =
-      unlines
-        [ "-- @generated by `cabal buck2` - do not edit by hand."
-        , "module " ++ modName
-        , "  ( version"
-        , "  , getBinDir, getLibDir, getDynLibDir, getDataDir, getLibexecDir"
-        , "  , getDataFileName, getSysconfDir"
-        , "  ) where"
-        , ""
-        , "import Data.Version (Version (..))"
-        , ""
-        , "version :: Version"
-        , "version = Version " ++ show (versionNumbers (packageVersion pkgDesc)) ++ " []"
-        , ""
-        , "-- buck2 has no \"install prefix\" concept to report here, unlike a"
-        , "-- real Cabal build - these are stand-ins, not meaningful paths."
-        , "getBinDir, getLibDir, getDynLibDir, getDataDir, getLibexecDir, getSysconfDir :: IO FilePath"
-        , "getBinDir = return \".\""
-        , "getLibDir = return \".\""
-        , "getDynLibDir = return \".\""
-        , "getDataDir = return \".\""
-        , "getLibexecDir = return \".\""
-        , "getSysconfDir = return \".\""
-        , ""
-        , "getDataFileName :: FilePath -> IO FilePath"
-        , "getDataFileName name = return name"
-        ]
+    relPath = "cabal-buck2" </> "autogen" </> (ModuleName.toFilePath m <.> "hs")
 
 -- | 'Nothing' if the main-is file couldn't be found - see 'resolveModules'
 -- for why the caller must skip the whole component rather than emit a
