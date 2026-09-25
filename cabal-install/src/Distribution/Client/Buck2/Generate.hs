@@ -45,7 +45,7 @@ import Distribution.Types.ModuleReexport
 import Distribution.Types.PackageName (PackageName)
 import Distribution.Version (Version)
 
-import Distribution.Simple.Utils (notice, warn)
+import Distribution.Simple.Utils (notice, ordNub, warn)
 
 import Distribution.Client.Buck2.CabalToBuck
 import Distribution.Client.Buck2.Starlark
@@ -85,7 +85,7 @@ generateAllPackages verbosity projectRoot pkgVersions pkgs = do
         , m <- exposedModules lib
         ]
     reexportOrigins pkgDesc =
-      nub
+      ordNub
         [ pn
         | Just lib <- [library pkgDesc]
         , reexport <- reexportedModules lib

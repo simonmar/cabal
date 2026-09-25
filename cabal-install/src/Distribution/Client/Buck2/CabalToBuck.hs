@@ -61,7 +61,7 @@ import Distribution.Version (Version, versionNumbers)
 
 import Distribution.Simple.Build.Macros (generatePackageVersionMacros)
 import Distribution.Simple.BuildPaths (autogenPathsModuleName)
-import Distribution.Simple.Utils (warn)
+import Distribution.Simple.Utils (ordNub, warn)
 
 import Distribution.Client.Buck2.Starlark
 
@@ -84,7 +84,7 @@ instance Semigroup PackageTargets where
     where
       addLoad acc (tgt, names) = case lookup tgt acc of
         Nothing -> acc ++ [(tgt, names)]
-        Just _ -> map (\(t, ns) -> if t == tgt then (t, nub (ns ++ names)) else (t, ns)) acc
+        Just _ -> map (\(t, ns) -> if t == tgt then (t, ordNub (ns ++ names)) else (t, ns)) acc
 
 instance Monoid PackageTargets where
   mempty = PackageTargets [] []
@@ -135,8 +135,8 @@ generatePackageTargets verbosity localIndex rootRelPkgDir pkgVersions pkgDir pkg
 -- pass exists only to know the *outcome* early, not to report it twice.
 skippedLibraries :: Verbosity -> PackageDescription -> FilePath -> IO (Set LibraryName)
 skippedLibraries verbosity pkgDesc pkgDir =
-  fmap (Set.fromList . catMaybes) $
-    traverse checkLib [lib | CLib lib <- pkgBuildableComponents pkgDesc]
+  (Set.fromList . catMaybes)
+    <$> traverse checkLib [lib | CLib lib <- pkgBuildableComponents pkgDesc]
   where
     quiet = modifyVerbosityFlags (\vf -> vf{vLevel = Silent}) verbosity
     checkLib lib = do
@@ -383,7 +383,7 @@ macrosFlagsArg pkgDir rootRelPkgDir targetName pkgDesc pkgVersions bi = do
   return ["-optP-include", "-optP" ++ (rootRelPkgDir </> headerRelPath)]
   where
     depPids =
-      nub
+      ordNub
         [ PackageIdentifier pn v
         | d <- targetBuildDepends bi
         , let pn = depPkgName d
@@ -396,7 +396,7 @@ macrosFlagsArg pkgDir rootRelPkgDir targetName pkgDesc pkgVersions bi = do
 
 optionalListArg :: String -> [String] -> [(String, Value)]
 optionalListArg _ [] = []
-optionalListArg name xs = [(name, strList (nub xs))]
+optionalListArg name xs = [(name, strList (ordNub xs))]
 
 -- | The buck2 target name for one of a package's libraries: the package
 -- name itself for the main (unnamed) library, matching every other
@@ -419,12 +419,12 @@ libTargetName _ (LSubLibName n) = unUnqualComponentName n
 -- local sub-library's own target when one was named).
 classifyDeps :: LocalPackageIndex -> BuildInfo -> ([String], [String])
 classifyDeps localIndex bi =
-  ( nub [unPackageName pn | (pn, _) <- allDeps, not (Map.member pn localIndex)]
-  , nub [localTargetLabel dir (libTargetName pn ln) | (pn, ln) <- allDeps, Just (dir, _) <- [Map.lookup pn localIndex]]
+  ( ordNub [unPackageName pn | (pn, _) <- allDeps, not (Map.member pn localIndex)]
+  , ordNub [localTargetLabel dir (libTargetName pn ln) | (pn, ln) <- allDeps, Just (dir, _) <- [Map.lookup pn localIndex]]
   )
   where
     directDeps =
-      nub
+      ordNub
         [ (depPkgName d, ln)
         | d <- targetBuildDepends bi
         , ln <- NES.toList (depLibraries d)
@@ -594,7 +594,7 @@ cxxLibraryFor _localIndex _pkgDir targetName bi
     srcs = map getSymbolicPath (cSources bi ++ cxxSources bi)
     cxxTargetName = targetName ++ "-cxx"
     includeFlags = ["-I" ++ getSymbolicPath d | d <- includeDirs bi]
-    pkgconfigNames = nub [unPkgconfigName n | PkgconfigDependency n _ <- pkgconfigDepends bi]
+    pkgconfigNames = ordNub [unPkgconfigName n | PkgconfigDependency n _ <- pkgconfigDepends bi]
     pkgconfigCalls =
       [ call
         "external_pkgconfig_library"

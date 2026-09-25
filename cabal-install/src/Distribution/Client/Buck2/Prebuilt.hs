@@ -84,7 +84,7 @@ import qualified Distribution.Simple.InstallDirs as InstallDirs
 import Distribution.Simple.Program.Builtin (ghcPkgProgram, ghcProgram)
 import Distribution.Simple.Program.Db (lookupProgram)
 import Distribution.Simple.Program.Types (ConfiguredProgram, programPath)
-import Distribution.Simple.Utils (dieWithException, notice, rawSystemExit, warn)
+import Distribution.Simple.Utils (dieWithException, notice, ordNub, rawSystemExit, warn)
 import Distribution.Types.InstalledPackageInfo
   ( InstalledPackageInfo
       ( depends
@@ -161,7 +161,7 @@ generatePrebuilt verbosity projectRoot cabalDirLayout distDirLayout shared depsP
           | pkg <- InstallPlan.toList depsPlan
           , Just elab <- [configuredOrInstalled pkg]
           ]
-      allUnitIds = nub [installedUnitId pkg | pkg <- InstallPlan.toList depsPlan]
+      allUnitIds = ordNub [installedUnitId pkg | pkg <- InstallPlan.toList depsPlan]
       -- A *local* unit id can genuinely turn up in 'depsPlan' (see this
       -- function's own haddock on 'pruneToDependenciesNeeded' kicking
       -- in) - its own real @haskell_library()@ already comes from
@@ -351,14 +351,14 @@ readPackage verbosity paths storeDB inplaceDB inplaceBuildDirs uid = do
                 Just dir -> munged{libraryDirs = [dir], libraryDynDirs = [dir]}
                 Nothing -> munged
               isRts = prettyShow (packageName ipi) == "rts"
-          staticLibs <- findLibs paths (libraryDirs ipi) [("lib" ++ stem <.> "a") | stem <- hsLibraries ipi]
+          staticLibs <- findLibs paths (libraryDirs ipi) ["lib" ++ stem <.> "a" | stem <- hsLibraries ipi]
           -- GHC doesn't build profiled RTS libraries the normal way - see
           -- gen-haskell-prebuilt.py's own note on this, which this
           -- inherits without fully understanding why either.
           profiledLibs <-
             if isRts
               then return []
-              else findLibs paths (libraryDirs ipi) [("lib" ++ stem ++ "_p" <.> "a") | stem <- hsLibraries ipi]
+              else findLibs paths (libraryDirs ipi) ["lib" ++ stem ++ "_p" <.> "a" | stem <- hsLibraries ipi]
           sharedLibs <- findSharedLibs paths ipi
           return $ Just (ResolvedPackage ipi uid dbKind path staticLibs profiledLibs sharedLibs)
 
@@ -500,7 +500,7 @@ prebuiltCall paths uidToTarget p =
     globalDbRel = ("ghc-" ++ rpGhcVersion paths) </> "package.conf.d"
     headerDirs = mapMaybe (toRepoRelative paths) (includeDirs info)
     extraLinkerFlags = ["-l" ++ lib | lib <- extraLibraries info]
-    depTargets = nub [":" ++ t | d <- depends info, Just t <- [Map.lookup d uidToTarget]]
+    depTargets = ordNub [":" ++ t | d <- depends info, Just t <- [Map.lookup d uidToTarget]]
 
 -- | Convert an absolute path under GHC's libdir, the cabal store, or one
 -- of the per-package inplace-build anchors, into one relative to
